@@ -1,3 +1,13 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: ComfyUI 操控插件：封装 comfyui-skill CLI 为 DSH 工具面（状态/工作流/提交/执行/任务/队列/模型/显存），支撑主人 Anima 生图体系
+  inject: 'tools'
+  tools: comfy_*
+  runtime: host-only
+  envDeps: ComfyUI 目录 + Python（可配置 comfyuiDir/comfyuiPython）
+  boundary: 无特殊授权边界
+  compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
+-->
 # dsh-comfyui
 
 ComfyUI 操控插件：封装 comfyui-skill CLI 为 DSH 工具面（状态/工作流/提交/执行/任务/队列/模型/显存），支撑主人 Anima 生图体系
