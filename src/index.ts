@@ -35,7 +35,7 @@ export interface Config {
 }
 export const Config = z.object({
   comfyuiBin: z.string().default('comfyui-skill'),
-  workspaceDir: z.string().default('E:/anima/comfyui-good-anima/comfyui-manager/workspace'),
+  workspaceDir: z.string().default('E:/alice/交接/02-技能包/comfyui-good-anima/comfyui-manager/workspace'),
   timeoutMs: z.number().default(120000),
   comfyuiDir: z.string().default('D:/桌面/ComfyUI'),
   comfyuiPython: z.string().default('D:/桌面/ComfyUI/.venv/Scripts/python.exe'),
