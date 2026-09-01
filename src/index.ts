@@ -15,6 +15,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { spawn } from 'node:child_process'
+import { existsSync, readFileSync, writeFileSync, copyFileSync, openSync, closeSync } from 'node:fs'
+import { join, dirname } from 'node:path'
 
 export const name = 'agent-comfyui'
 export const inject = ['tools'] as const
@@ -43,6 +45,94 @@ export const Config = z.object({
 })
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** python --version 探活（短超时）。 */
+function pythonVersion(pythonPath: string, timeoutMs = 10000): Promise<{ ok: boolean; version: string; reason?: string }> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(pythonPath, ['--version'], { windowsHide: true })
+    } catch (err) {
+      resolve({ ok: false, version: '', reason: String(err) })
+      return
+    }
+    let out = ''
+    let errOut = ''
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* 已退出 */ }
+      resolve({ ok: false, version: out.trim(), reason: 'python --version 超时（' + timeoutMs + 'ms）' })
+    }, timeoutMs)
+    child.stdout?.on('data', (d: Buffer) => { out += d.toString('utf8') })
+    child.stderr?.on('data', (d: Buffer) => { errOut += d.toString('utf8') })
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, version: '', reason: e.message }) })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      const v = (out + errOut).trim()
+      resolve({ ok: code === 0, version: v, ...(code !== 0 ? { reason: 'python --version 退出 code=' + String(code) + '：' + v } : {}) })
+    })
+  })
+}
+
+/** venv 断裂检测：pyvenv.cfg 的 home 指向不存在的 base 解释器。 */
+function venvBrokenInfo(pythonPath: string): { cfgPath: string; broken: boolean; home: string } {
+  const venvDir = dirname(pythonPath)
+  const cfgPath = join(venvDir, '..', 'pyvenv.cfg')
+  if (!existsSync(cfgPath)) return { cfgPath, broken: false, home: '' }
+  try {
+    const cfg = readFileSync(cfgPath, 'utf8')
+    const m = cfg.match(/^home\s*=\s*(.+)$/m)
+    if (m === null) return { cfgPath, broken: false, home: '' }
+    const home = (m[1] ?? '').trim().replace(/[\\/]+$/, '')
+    const basePy = join(home, 'python.exe')
+    return { cfgPath, broken: !existsSync(basePy), home }
+  } catch {
+    return { cfgPath, broken: false, home: '' }
+  }
+}
+
+/** 修复 venv：把 pyvenv.cfg 的 home 指向候选 base（备份原文件），逐个候选验证。 */
+async function repairVenv(pythonPath: string, cfgPath: string, brokenHome: string): Promise<{ ok: boolean; reason?: string }> {
+  const candidates = [
+    'C:/Users/tr/scoop/apps/python312/current',
+    'C:/Users/tr/scoop/apps/python/current',
+  ]
+  let orig = ''
+  try { orig = readFileSync(cfgPath, 'utf8') } catch (e) { return { ok: false, reason: '读取 pyvenv.cfg 失败: ' + String(e) } }
+  const backup = cfgPath + '.bak'
+  if (!existsSync(backup)) {
+    try { copyFileSync(cfgPath, backup) } catch { /* 备份非必需 */ }
+  }
+  for (const base of candidates) {
+    if (!existsSync(join(base, 'python.exe'))) continue
+    try {
+      writeFileSync(cfgPath, orig.replace(/^home\s*=.*$/m, 'home = ' + base.replace(/[\\/]+$/, '')), 'utf8')
+    } catch { continue }
+    const vc = await pythonVersion(pythonPath)
+    if (vc.ok) return { ok: true }
+    try { writeFileSync(cfgPath, orig, 'utf8') } catch { /* 还原失败继续 */ }
+  }
+  try { writeFileSync(cfgPath, orig, 'utf8') } catch { /* 兜底还原 */ }
+  return { ok: false, reason: 'venv 断裂（home=' + brokenHome + '），候选 base 均无法修复' }
+}
+
+/** python 环境预检：存在性 + venv 断裂检测/自愈 + 可执行探活。返回可用 python 路径。 */
+async function checkPythonEnv(pythonPath: string): Promise<{ ok: boolean; pythonPath: string; reason?: string; repaired?: boolean }> {
+  if (!existsSync(pythonPath)) {
+    return { ok: false, pythonPath, reason: 'python 不存在: ' + pythonPath + '（可 plugin_configure dsh-comfyui 改 comfyuiPython）' }
+  }
+  const vb = venvBrokenInfo(pythonPath)
+  const vc = await pythonVersion(pythonPath)
+  if (vc.ok) return { ok: true, pythonPath, ...(vb.broken ? { reason: '（注：venv home 指向缺失，但探活通过，可运行）' } : {}) }
+  if (vb.broken) {
+    const rep = await repairVenv(pythonPath, vb.cfgPath, vb.home)
+    if (rep.ok) {
+      const vc2 = await pythonVersion(pythonPath)
+      if (vc2.ok) return { ok: true, pythonPath, repaired: true }
+    }
+    return { ok: false, pythonPath, reason: rep.reason ?? vc.reason }
+  }
+  return { ok: false, pythonPath, reason: vc.reason ?? 'python 不可执行' }
+}
 
 /** 调用 comfyui-skill，返回解析后的 JSON（stdout 首 JSON 对象） */
 function runCli(config: Config, args: string[], timeoutMs?: number): Promise<{ ok: boolean; data: any; raw: string; stderr: string }> {
@@ -78,7 +168,13 @@ function runCli(config: Config, args: string[], timeoutMs?: number): Promise<{ o
     })
     child.on('error', (err) => {
       clearTimeout(timer)
-      resolve({ ok: false, data: null, raw: '', stderr: '无法启动 comfyui-skill：' + err.message })
+      const e = err as NodeJS.ErrnoException
+      const kind = e.code === 'ENOENT'
+        ? 'comfyui-skill 未找到（ENOENT）——请确认 CLI 已安装并加入 PATH，或用 plugin_configure dsh-comfyui 设置 comfyuiBin 绝对路径'
+        : e.code === 'EACCES'
+          ? 'comfyui-skill 无执行权限（EACCES）'
+          : '无法启动 comfyui-skill'
+      resolve({ ok: false, data: null, raw: '', stderr: kind + '：' + e.message })
     })
   })
 }
@@ -133,7 +229,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- comfy_start：启动 ComfyUI 服务器 ----------
   ctx.tools.register(defineTool({
     name: 'comfy_start',
-    description: '启动 ComfyUI 服务器（后台 detached 进程，不随 web 退出）：spawn python main.py --listen 127.0.0.1 --port 8300，轮询 system_stats 直到在线（最长 120s）。已在线则直接返回。',
+    description: '启动 ComfyUI 服务器（后台 detached 进程，不随 web 退出）：spawn python main.py --listen 127.0.0.1 --port 8300，轮询 system_stats 直到在线（最长 300s，冷启动需 2-4 分钟；超时后进程继续启动，可用 comfy_status 复查）。已在线则直接返回。',
     parameters: {},
     output: {
       schema: {
@@ -154,29 +250,108 @@ export function apply(ctx: Context, config: Config): void {
       if (pre.data?.status === 'online') {
         return { ok: true, url: 'http://127.0.0.1:' + config.comfyuiPort, status: pre.data }
       }
-      // spawn 后台进程（detached + stdio ignore：独立生命周期，不随 DSH web 退出）
+      // python 环境预检（存在性 + venv 断裂自愈 + 可执行探活）——避免 120s 干等静默失败
+      const env = await checkPythonEnv(config.comfyuiPython)
+      if (!env.ok) {
+        return { ok: false, error: 'ComfyUI python 环境异常：' + (env.reason ?? '未知') }
+      }
+      const pythonPath = env.pythonPath
+      // 启动日志落盘（stdout/stderr 重定向到文件——失败时可查，不再 stdio ignore）
+      const logPath = join(config.comfyuiDir, '.dsh-comfyui-startup.log')
+      let logFd: number | undefined
+      try { logFd = openSync(logPath, 'a') } catch { /* 日志打不开不阻塞启动 */ }
       let pid: number | undefined
       try {
-        const child = spawn(config.comfyuiPython, ['main.py', '--listen', '127.0.0.1', '--port', String(config.comfyuiPort), '--enable-manager', '--preview-method', 'auto'], {
+        // -u 无缓冲：启动日志实时可读（排障时 tail 不再滞后）
+        const child = spawn(pythonPath, ['-u', 'main.py', '--listen', '127.0.0.1', '--port', String(config.comfyuiPort), '--enable-manager', '--preview-method', 'auto'], {
           cwd: config.comfyuiDir,
           detached: true,
-          stdio: 'ignore',
+          stdio: logFd !== undefined ? ['ignore', logFd, logFd] : 'ignore',
           windowsHide: true,
         })
         child.unref()
         pid = child.pid
+        // 父进程关闭自己的 fd 副本；子进程已持有重复句柄继续写日志
+        if (logFd !== undefined) { try { closeSync(logFd) } catch { /* 忽略 */ } }
+        logFd = undefined
+        child.on('error', (err) => {
+          // spawn 失败（如 python 不可执行）——记录但由轮询/超时统一收尾
+          const e = err as NodeJS.ErrnoException
+          logger.warn('comfy_start spawn error: ' + e.code + ' ' + e.message)
+        })
       } catch (err) {
+        if (logFd !== undefined) { try { closeSync(logFd) } catch { /* 忽略 */ } }
         return { ok: false, error: '无法启动 ComfyUI 进程：' + String(err) }
       }
-      // 轮询就绪（最长 120s，每 3s 一次）
-      for (let i = 0; i < 40; i += 1) {
+      // 轮询就绪（最长 300s，每 3s 一次）——冷启动实测 2-4 分钟：Manager 启动要 FETCH 180 项
+      // 注册表数据 + 冷文件缓存 + Defender 扫描新进程，120s 会误杀正常冷启动（2026-09-01 实测）
+      for (let i = 0; i < 100; i += 1) {
         await sleep(3000)
         const st = await runCli(config, ['server', 'status'], 15000)
         if (st.data?.status === 'online') {
-          return { ok: true, pid, url: 'http://127.0.0.1:' + config.comfyuiPort, status: st.data }
+          return { ok: true, pid, url: 'http://127.0.0.1:' + config.comfyuiPort, status: st.data, ...(env.repaired === true ? { note: 'venv 已自动修复（pyvenv.cfg home 重指向）' } : {}) }
         }
       }
-      return { ok: false, pid, error: '启动超时（120s 未就绪）；进程 pid=' + String(pid) + '，查看 ' + config.comfyuiDir + ' 日志' }
+      // 超时诊断：读启动日志尾部（如果有）
+      let logTail = ''
+      try {
+        const content = readFileSync(logPath, 'utf8')
+        logTail = content.slice(-800).trim()
+      } catch { /* 无日志 */ }
+      return { ok: false, pid, error: '启动超时（300s 未就绪，冷启动可能仍需更久——进程未杀，稍后用 comfy_status 复查）；进程 pid=' + String(pid) + '，启动日志尾：' + (logTail || '（无日志——请检查 ' + config.comfyuiDir + ' 目录权限）') }
+    },
+  }))
+
+  // ---------- comfy_stop：停止 ComfyUI 服务器（对称于 comfy_start） ----------
+  ctx.tools.register(defineTool({
+    name: 'comfy_stop',
+    description: '停止 ComfyUI 服务器：按端口找到监听进程并 taskkill /F。需先 comfy_status 确认在线。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          pid: { type: 'number' },
+          result: { type: 'json' },
+          error: { type: 'string' },
+        },
+      },
+      render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? 'ComfyUI 已停止（pid ' + String(v.pid) + '）' : '停止失败：' + String(v.error ?? '').slice(0, 120) }],
+    },
+    async execute() {
+      // 按端口找监听进程 PID（netstat 解析）
+      const pid = await new Promise<number | undefined>((resolve) => {
+        const child = spawn('netstat', ['-ano'], { windowsHide: true })
+        let out = ''
+        child.stdout.on('data', (d: Buffer) => { out += d.toString('utf8') })
+        child.on('error', () => resolve(undefined))
+        child.on('close', () => {
+          const portStr = String(config.comfyuiPort)
+          const match = out.split(/\r?\n/).find((line) => {
+            const parts = line.trim().split(/\s+/)
+            return parts.length >= 5 && parts[1] !== undefined && parts[1].endsWith(':' + portStr) && (parts[3] === 'LISTENING' || parts[3] === 'LISTEN')
+          })
+          if (match === undefined) { resolve(undefined); return }
+          const pidPart = match.trim().split(/\s+/).pop()
+          const n = pidPart !== undefined ? parseInt(pidPart, 10) : NaN
+          resolve(Number.isFinite(n) && n > 0 ? n : undefined)
+        })
+      })
+      if (pid === undefined) {
+        return { ok: false, pid: undefined, result: null, error: '端口 ' + config.comfyuiPort + ' 无监听进程（服务器未运行？）' }
+      }
+      const killed = await new Promise<boolean>((resolve) => {
+        const child = spawn('taskkill', ['/F', '/PID', String(pid)], { windowsHide: true })
+        let err = ''
+        child.stderr.on('data', (d: Buffer) => { err += d.toString('utf8') })
+        child.on('error', () => resolve(false))
+        child.on('close', (code) => { resolve(code === 0 || err.includes('successfully')) })
+      })
+      if (!killed) {
+        return { ok: false, pid, result: null, error: 'taskkill 失败（pid=' + pid + '）——可能需要管理员权限' }
+      }
+      return { ok: true, pid, result: { pid, port: config.comfyuiPort, stopped: true } }
     },
   }))
 
@@ -540,7 +715,7 @@ export function apply(ctx: Context, config: Config): void {
   }))
 
   ctx.effect(() => {
-    logger.info('ready（comfyui-skill 操控面：13 工具；workspace=' + config.workspaceDir + '；服务器离线时工具返回结构化错误）')
+    logger.info('ready（comfyui-skill 操控面：14 工具；workspace=' + config.workspaceDir + '；服务器离线时工具返回结构化错误）')
     return () => { /* 清理 */ }
   })
 }
