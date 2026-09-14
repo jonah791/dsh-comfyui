@@ -134,7 +134,13 @@ dsh-comfyui/src/index.ts
 | A5 | `comfy_stop` 只杀端口监听进程 | 执行前后 `netstat -ano \| findstr :8300` 有无变化 | 待验收 |
 | A6 | 幂等：已在线时 `comfy_start` 不新起进程 | 调用前后 PID 不变（`comfy_status` 的 `status.server_id`/`netstat` 对比） | 待验收 |
 | A7 | `comfy_workflows` 空列表回退扫描生效 | 造 `data/local/<name>/workflow.json` → `comfy_workflows` 返回 `format:'dir'` 条目 | 待验收 |
-| A8 | venv 自愈不改坏环境 | 人为把 `pyvenv.cfg` 的 `home` 改错 → `comfy_start` 后备份 `pyvenv.cfg.bak` 存在且 `python --version` 可用 | 待验收 |
+| A8 | venv 自愈不改坏环境 | 人为把 `pyvenv.cfg` 的 `home` 改错 → `comfy_start` 后备份 `pyvenv.cfg.bak` 存在且 `python --version` 可用 | 待验收（需真机 venv） |
+| A9 | CLI 参数拼装恒为 `--json --dir <ws>` 前缀（含空参数数组/空串入参的退化） | `node --test "tests/*.test.mjs"` → `tests/cli.test.mjs` `buildCliArgs` 用例 | **已验收**（2026-09-14 · 60/60 全绿） |
+| A10 | 入参校验拒收非法动作/缺参（queue/task），**不落到 CLI** | 同上 `planQueueCliArgs` / `planTaskCliArgs` 失败路径用例 | **已验收** |
+| A11 | 错误分类优先序 data → stderr → raw → 兜底，截断 500；退化 data（空对象/数组/标量）不误判为错误载荷 | 同上 `cliError` 用例 | **已验收** |
+| A12 | `comfy_workflows` 空列表回退的分类判定：三格式顺序、未声明 server 整棵跳过、目录探针缺失不计入、`.json` 大小写敏感 | `tests/workflows.test.mjs`（`parseWorkspaceConfig` + `discoverWorkflows`） | **已验收** |
+| A13 | pyvenv.cfg 解析的语义分界：无 home 行 ⇒ `null`（未断裂）vs 值为空白 ⇒ `''`（走探活）；CRLF / 尾部分隔符 | `tests/venv.test.mjs` | **已验收** |
+| A14 | 不变量守卫：I1 不触网 / I3 恰好 14 工具 / I4 启动日志落点（检测器先过尸体样本） | `tests/invariants.test.mjs` | **已验收** |
 
 ## 8 · 与实现的关系
 
@@ -142,7 +148,12 @@ dsh-comfyui/src/index.ts
 - 同语义副本：无。CLI 侧语义（`comfyui-skill` 的子命令语义）**不在本文管辖**，以该 CLI 自身文档为准。
 - 未实现/未显式化的部分：
   - `comfy_templates` / `comfy_nodes` / `comfy_logs` 声明了 `action` 参数但**仅忽略值固定发 `list`/`show`**——文档如实记录，不粉饰。
-  - 无单测（本仓库无 `tests/`）：验收 A1–A8 均为**待验收**，须在线上用命令取证，不得用「已实现」笼统掩盖。
+  - 纯逻辑层已抽成模块（2026-09-14 补课，**行为不变**）：`src/cli.ts`（CLI 参数拼装 / 入参校验 / 结果组装 / 错误分类）、
+    `src/workflows.ts`（`config.json` 解析 + `data/` 树分类）、`src/venv.ts`（`pyvenv.cfg` 路径与解析）；
+    `src/index.ts` 只保留接线与 IO（`spawn` / `readdirSync` / 文件改写）。
+  - **离线单测**：`tests/{cli,workflows,venv,invariants}.test.mjs`，60 条，跑 `lib/` 产物（与运行时同源），零网络零 IO。
+  - A1–A8 中依赖真机/在线的条目（A3–A8）仍为**待验收**，须在线上用命令取证，不得用「已实现」笼统掩盖；
+    与纯逻辑相关的 A9–A14 已由离线单测锁定。
 
 ## 9 · 实践修订记录
 
@@ -152,8 +163,24 @@ dsh-comfyui/src/index.ts
   - 语义**被修正**：无（首次成文）。
   - 教训：机制的关键落盘产物若只存在于源码注释，压缩后的我无法从外部回答「它到底怎么启动的」——文档必须写落点。
 
+- **2026-09-14 补课：抽出纯逻辑层 + 60 条离线单测（可维护性补课 S3/S6）**
+  - 语义**被补充**：`comfy_workflows` 空列表回退的判定顺序与过滤条件（未声明 server 目录整棵跳过、`.json` 大小写敏感、
+    目录探针 `hasWorkflowJson !== true` 不计入）此前只存在于代码行里，现由 `tests/workflows.test.mjs` 显式化。
+  - 语义**被记录（不改行为）**：`parsePyvenvHome` 的「未匹配（`null`）」与「匹配但值为空（`''`）」是**不同分支**——
+    后者会真的去探 `join('', 'python.exe')` 并可能判「断裂」。旧代码用内联 regex + `if (m === null)` 表达同一语义，
+    但没有任何地方写明；现以返回 `null` 区分并加测试钉死。
+  - 语义**被记录**：`composeStatusResult(status, null, true)` 属**调用前置条件违规**（抛 TypeError）——调用方必须先用
+    `needsStats()` 门控。刻意**不**改成静默兜底：静默会掩盖接线错误（测试以边界用例钉住该契约）。
+  - 语义**被修正**：无——本插件本轮**未发现行为级缺陷**；所有观察到的边界语义一律按「如实记录、不改行为」处置。
+  - 教训：单文件插件把「判定逻辑」与「IO」焊在一起时，任何边界语义都无法离线复现；**搬家不改语义**是解锁测试的最小代价手段。
+
 ## 10 · 未决问题
 
-- **U1 验收无单测**：本仓库无 `tests/`，A1–A8 只能靠线上命令取证。是否为纯 CLI 封装补一层可离线测试的参数构造纯函数？（倾向：抽 `buildCliArgs()` 并加 4 条单测）
+- ~~**U1 验收无单测**：本仓库无 `tests/`，A1–A8 只能靠线上命令取证。是否为纯 CLI 封装补一层可离线测试的参数构造纯函数？~~
+  **已闭环（2026-09-14）**：抽出 `cli.ts` / `workflows.ts` / `venv.ts` 纯逻辑层 + `tests/*.test.mjs` 60 条（含失败/退化路径），
+  A9–A14 已验收；依赖真机的 A3–A8 保持待验收。
+- **U4 接线层无自动化验证**：`comfy_start` 的进程启动、`comfy_stop` 的 `taskkill`、`runCli` 的真子进程路径**没有离线单测**
+  （需真机/真 CLI；起服务会占用主人环境，本轮明确禁止）。当前覆盖为「纯逻辑层全测 + 线上探针 A3–A8」两层；
+  倾向**不做假 CLI 桩**替代真实集成验收（桩只证明桩自己的假设）。
 - **U2 `comfy_templates`/`comfy_nodes` 的 `action` 形参**：目前只支持 list/show 且值被忽略——是收敛签名（去掉参数）还是补齐 action 分流？需主人裁决。
 - **U3 端口/进程所有权**：`comfy_stop` 用 `taskkill /F` 杀端口监听者；若未来有第二个 owner 也管 8300，需按 AGENTS.md §5.19 引入租约——当前无此冲突，先记为风险。

@@ -16,7 +16,15 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync, copyFileSync, openSync, closeSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join } from 'node:path'
+import {
+  buildCliArgs, appendOption, appendArgsOption, cliError,
+  planWorkflowsCliArgs, planModelsCliArgs, planQueueCliArgs, planTaskCliArgs,
+  needsStats, composeStatusResult, composeSubmitResult,
+  type CliResult,
+} from './cli.js'
+import { discoverWorkflows, parseWorkspaceConfig, type ScanChild, type ScanEntry } from './workflows.js'
+import { pyvenvCfgPath, parsePyvenvHome, basePythonPath } from './venv.js'
 
 export const name = 'agent-comfyui'
 export const inject = ['tools'] as const
@@ -73,18 +81,16 @@ function pythonVersion(pythonPath: string, timeoutMs = 10000): Promise<{ ok: boo
   })
 }
 
-/** venv 断裂检测：pyvenv.cfg 的 home 指向不存在的 base 解释器。 */
+/** venv 断裂检测：pyvenv.cfg 的 home 指向不存在的 base 解释器。（路径推导与文本解析在 venv.ts，纯函数） */
 function venvBrokenInfo(pythonPath: string): { cfgPath: string; broken: boolean; home: string } {
-  const venvDir = dirname(pythonPath)
-  const cfgPath = join(venvDir, '..', 'pyvenv.cfg')
+  const cfgPath = pyvenvCfgPath(pythonPath)
   if (!existsSync(cfgPath)) return { cfgPath, broken: false, home: '' }
   try {
     const cfg = readFileSync(cfgPath, 'utf8')
-    const m = cfg.match(/^home\s*=\s*(.+)$/m)
-    if (m === null) return { cfgPath, broken: false, home: '' }
-    const home = (m[1] ?? '').trim().replace(/[\\/]+$/, '')
-    const basePy = join(home, 'python.exe')
-    return { cfgPath, broken: !existsSync(basePy), home }
+    const home = parsePyvenvHome(cfg)
+    // null = 文件里没有 home 行（未断裂）；'' = 有 home 行但值为空（仍按原语义探 join('', 'python.exe')）
+    if (home === null) return { cfgPath, broken: false, home: '' }
+    return { cfgPath, broken: !existsSync(basePythonPath(home)), home }
   } catch {
     return { cfgPath, broken: false, home: '' }
   }
@@ -135,9 +141,9 @@ async function checkPythonEnv(pythonPath: string): Promise<{ ok: boolean; python
 }
 
 /** 调用 comfyui-skill，返回解析后的 JSON（stdout 首 JSON 对象） */
-function runCli(config: Config, args: string[], timeoutMs?: number): Promise<{ ok: boolean; data: any; raw: string; stderr: string }> {
+function runCli(config: Config, args: string[], timeoutMs?: number): Promise<CliResult> {
   return new Promise((resolve) => {
-    const child = spawn(config.comfyuiBin, ['--json', '--dir', config.workspaceDir, ...args], {
+    const child = spawn(config.comfyuiBin, buildCliArgs(config.workspaceDir, args), {
       windowsHide: true,
       shell: false,
     })
@@ -179,16 +185,6 @@ function runCli(config: Config, args: string[], timeoutMs?: number): Promise<{ o
   })
 }
 
-/** 从 CLI 结果构建统一错误信息 */
-function cliError(r: { ok: boolean; data: any; raw: string; stderr: string }): string | null {
-  if (r.ok) return null
-  const d = r.data as { error?: string; status?: string } | null
-  if (d !== null && typeof d === 'object' && (d.error !== undefined || d.status !== undefined)) {
-    return JSON.stringify(d).slice(0, 500)
-  }
-  return (r.stderr || r.raw || 'comfyui-skill 执行失败').slice(0, 500)
-}
-
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-comfyui')
 
@@ -213,16 +209,9 @@ export function apply(ctx: Context, config: Config): void {
     },
     async execute(args: { withStats?: boolean }) {
       const status = await runCli(config, ['server', 'status'])
-      const statusErr = cliError(status)
-      if (statusErr !== null && status.data === null) {
-        return { ok: false, status: null, stats: null, error: statusErr }
-      }
-      if (args.withStats === true && (status.data as { status?: string })?.status === 'online') {
-        const stats = await runCli(config, ['server', 'stats'])
-        const statsErr = cliError(stats)
-        return { ok: statsErr === null, status: status.data, stats: stats.data, ...(statsErr !== null ? { error: statsErr } : {}) }
-      }
-      return { ok: (status.data as { status?: string })?.status === 'online', status: status.data, stats: null, ...(statusErr !== null ? { error: statusErr } : {}) }
+      // 只有「显式 withStats===true 且已在线」才发第二次 CLI 调用（判据在 cli.ts:needsStats，纯函数已单测）
+      const stats = needsStats(status.data, args.withStats) ? await runCli(config, ['server', 'stats']) : null
+      return composeStatusResult(status, stats, args.withStats)
     },
   }))
 
@@ -374,50 +363,46 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '工作流：' + JSON.stringify(v.workflows).slice(0, 120) : '查询失败：' + String(v.error ?? '').slice(0, 80) }],
     },
     async execute(args: { id?: string }) {
-      const r = args.id !== undefined
-        ? await runCli(config, ['info', args.id])
-        : await runCli(config, ['list'])
+      const r = await runCli(config, planWorkflowsCliArgs(args.id))
       const err = cliError(r)
       if (err !== null) return { ok: false, workflows: null, error: err }
       // CLI list 对无 schema 的工作流返回 []——回退扫描 data/ 目录发现工作流（2026-08-19）
       // 同时发现两种格式：目录格式（data/<server>/<name>/workflow.json）和文件格式（data/*.json）
       // 只扫描 config.json 中声明的 server 目录，避免把工作流目录误认为 server 目录
+      // 分类判定抽在 workflows.ts（纯函数）；本处只做 IO：把目录树规范化后交给 discoverWorkflows。
       if (Array.isArray(r.data) && r.data.length === 0) {
         try {
           const { readdirSync, existsSync, readFileSync } = await import('node:fs')
           const { join } = await import('node:path')
           const base = join(config.workspaceDir, 'data')
           // 读 config.json 获取 server 列表
-          let serverIds: Set<string> = new Set(['local'])
-          let defaultServer = 'local'
-          try {
-            const cfg = JSON.parse(readFileSync(join(config.workspaceDir, 'config.json'), 'utf8')) as { servers?: { id: string }[]; default_server?: string }
-            if (Array.isArray(cfg.servers)) serverIds = new Set(cfg.servers.map(s => s.id))
-            if (cfg.default_server !== undefined) defaultServer = cfg.default_server
-          } catch { /* 用默认 */ }
-          const found: { workflow_id: string; server_id: string; enabled: boolean; format: string }[] = []
+          let cfgText = ''
+          try { cfgText = readFileSync(join(config.workspaceDir, 'config.json'), 'utf8') } catch { /* 用默认 */ }
+          const { serverIds, defaultServer } = parseWorkspaceConfig(cfgText)
+          const entries: ScanEntry[] = []
           if (existsSync(base)) {
             for (const entry of readdirSync(base, { withFileTypes: true })) {
+              const kind = entry.isDirectory() ? 'dir' as const : entry.isFile() ? 'file' as const : 'other' as const
               // 只扫描 config.json 中声明的 server 目录
-              if (entry.isDirectory() && serverIds.has(entry.name)) {
+              if (kind === 'dir' && serverIds.has(entry.name)) {
                 const serverDir = join(base, entry.name)
+                const children: ScanChild[] = []
                 for (const wf of readdirSync(serverDir, { withFileTypes: true })) {
-                  // 目录格式：data/<server>/<name>/workflow.json
-                  if (wf.isDirectory() && existsSync(join(serverDir, wf.name, 'workflow.json'))) {
-                    found.push({ workflow_id: wf.name, server_id: entry.name, enabled: true, format: 'dir' })
-                  }
-                  // 文件格式：data/<server>/*.json
-                  if (wf.isFile() && wf.name.endsWith('.json')) {
-                    found.push({ workflow_id: wf.name.slice(0, -5), server_id: entry.name, enabled: true, format: 'file' })
-                  }
+                  const wfKind = wf.isDirectory() ? 'dir' as const : wf.isFile() ? 'file' as const : 'other' as const
+                  // 目录格式探针：data/<server>/<name>/workflow.json
+                  children.push({
+                    name: wf.name,
+                    kind: wfKind,
+                    ...(wfKind === 'dir' ? { hasWorkflowJson: existsSync(join(serverDir, wf.name, 'workflow.json')) } : {}),
+                  })
                 }
-              }
-              // 顶层文件格式：data/*.json（用 default_server）
-              if (entry.isFile() && entry.name.endsWith('.json')) {
-                found.push({ workflow_id: entry.name.slice(0, -5), server_id: defaultServer, enabled: true, format: 'file-top' })
+                entries.push({ name: entry.name, kind, children })
+              } else {
+                entries.push({ name: entry.name, kind })
               }
             }
           }
+          const found = discoverWorkflows(entries, serverIds, defaultServer)
           if (found.length > 0) return { ok: true, workflows: found }
         } catch { /* 目录扫描失败则返回 CLI 结果 */ }
       }
@@ -446,14 +431,9 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '已提交 ' + v.promptId : '提交失败：' + String(v.error ?? '').slice(0, 100) }],
     },
     async execute(args: { id: string; args?: string }) {
-      const cliArgs = ['submit', args.id]
-      if (args.args !== undefined && args.args.trim() !== '') cliArgs.push('--args=' + args.args.trim())
+      const cliArgs = appendArgsOption(['submit', args.id], args.args)
       const r = await runCli(config, cliArgs, 60000)
-      const err = cliError(r)
-      if (err !== null) return { ok: false, promptId: undefined, result: null, error: err }
-      const data = r.data as { prompt_id?: string; id?: string } | null
-      const promptId = data?.prompt_id ?? data?.id
-      return { ok: promptId !== undefined, promptId, result: r.data, ...(promptId === undefined ? { error: '提交成功但无 prompt_id' } : {}) }
+      return composeSubmitResult(r)
     },
   }))
 
@@ -478,8 +458,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '执行完成：' + JSON.stringify(v.result).slice(0, 120) : '执行失败：' + String(v.error ?? '').slice(0, 100) }],
     },
     async execute(args: { id: string; args?: string; timeoutMs?: number }) {
-      const cliArgs = ['run', args.id]
-      if (args.args !== undefined && args.args.trim() !== '') cliArgs.push('--args=' + args.args.trim())
+      const cliArgs = appendArgsOption(['run', args.id], args.args)
       const r = await runCli(config, cliArgs, args.timeoutMs ?? config.timeoutMs)
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
@@ -508,20 +487,9 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '任务 ' + String(v.result?.status ?? '') + '：' + JSON.stringify(v.result).slice(0, 100) : '失败：' + String(v.error ?? '').slice(0, 80) }],
     },
     async execute(args: { action: string; promptId?: string; workflowId?: string }) {
-      let cliArgs: string[] = []
-      if (args.action === 'status') {
-        if (args.promptId === undefined) return { ok: false, result: null, error: 'status 需要 promptId' }
-        cliArgs = ['status', args.promptId]
-      } else if (args.action === 'cancel') {
-        if (args.promptId === undefined) return { ok: false, result: null, error: 'cancel 需要 promptId' }
-        cliArgs = ['cancel', args.promptId]
-      } else if (args.action === 'history') {
-        if (args.workflowId === undefined) return { ok: false, result: null, error: 'history 需要 workflowId' }
-        cliArgs = ['history', 'list', args.workflowId]
-      } else {
-        return { ok: false, result: null, error: 'action 须为 status|cancel|history' }
-      }
-      const r = await runCli(config, cliArgs, 60000)
+      const plan = planTaskCliArgs(args.action, args.promptId, args.workflowId)
+      if (!plan.ok) return { ok: false, result: null, error: plan.error }
+      const r = await runCli(config, plan.cliArgs, 60000)
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
       return { ok: true, result: r.data }
@@ -547,10 +515,9 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '队列：' + JSON.stringify(v.result).slice(0, 120) : '失败：' + String(v.error ?? '').slice(0, 80) }],
     },
     async execute(args: { action: string }) {
-      if (args.action !== 'list' && args.action !== 'clear') {
-        return { ok: false, result: null, error: 'action 须为 list|clear' }
-      }
-      const r = await runCli(config, ['queue', args.action], 60000)
+      const plan = planQueueCliArgs(args.action)
+      if (!plan.ok) return { ok: false, result: null, error: plan.error }
+      const r = await runCli(config, plan.cliArgs, 60000)
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
       return { ok: true, result: r.data }
@@ -576,9 +543,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '模型：' + JSON.stringify(v.result).slice(0, 120) : '失败：' + String(v.error ?? '').slice(0, 80) }],
     },
     async execute(args: { folder?: string }) {
-      const r = args.folder !== undefined
-        ? await runCli(config, ['models', 'list', args.folder], 60000)
-        : await runCli(config, ['models', 'list'], 60000)
+      const r = await runCli(config, planModelsCliArgs(args.folder), 60000)
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
       return { ok: true, result: r.data }
@@ -629,8 +594,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '已上传：' + JSON.stringify(v.result).slice(0, 120) : '上传失败：' + String(v.error ?? '').slice(0, 100) }],
     },
     async execute(args: { filePath: string; fromOutput?: string }) {
-      const cliArgs = ['upload', args.filePath]
-      if (args.fromOutput !== undefined && args.fromOutput.trim() !== '') cliArgs.push('--from-output=' + args.fromOutput.trim())
+      const cliArgs = appendOption(['upload', args.filePath], '--from-output=', args.fromOutput)
       const r = await runCli(config, cliArgs, 120000)
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
