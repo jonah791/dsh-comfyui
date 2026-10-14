@@ -21,15 +21,15 @@ test('pyvenvCfgPath: 退化输入——空串/相对路径不抛（返回相对 
 })
 
 test('basePythonPath: 正常与退化（home 为空 ⇒ 相对路径，交给 existsSync 判否）', () => {
-  assert.equal(posix(basePythonPath('C:/Users/tr/scoop/apps/python312/current')), 'C:/Users/tr/scoop/apps/python312/current/python.exe')
+  assert.equal(posix(basePythonPath('C:/Users/demo/scoop/apps/python312/current')), 'C:/Users/demo/scoop/apps/python312/current/python.exe')
   assert.equal(posix(basePythonPath('')), 'python.exe')
 })
 
 // ---------- parsePyvenvHome ----------
 
 test('parsePyvenvHome: 正常路径——取 home 值（其余行忽略）', () => {
-  const cfg = 'home = C:/Users/tr/scoop/apps/python312/current\ninclude = C:/Python312/Lib/site-packages\nversion = 3.12.7\n'
-  assert.equal(parsePyvenvHome(cfg), 'C:/Users/tr/scoop/apps/python312/current')
+  const cfg = 'home = C:/Users/demo/scoop/apps/python312/current\ninclude = C:/Python312/Lib/site-packages\nversion = 3.12.7\n'
+  assert.equal(parsePyvenvHome(cfg), 'C:/Users/demo/scoop/apps/python312/current')
 })
 
 test('parsePyvenvHome: 边界——剥尾部分隔符（正/反斜杠，含多个）', () => {

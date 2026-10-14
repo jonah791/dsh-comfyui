@@ -99,8 +99,8 @@ function venvBrokenInfo(pythonPath: string): { cfgPath: string; broken: boolean;
 /** 修复 venv：把 pyvenv.cfg 的 home 指向候选 base（备份原文件），逐个候选验证。 */
 async function repairVenv(pythonPath: string, cfgPath: string, brokenHome: string): Promise<{ ok: boolean; reason?: string }> {
   const candidates = [
-    'C:/Users/tr/scoop/apps/python312/current',
-    'C:/Users/tr/scoop/apps/python/current',
+    '<home>/scoop/apps/python312/current',
+    '<home>/scoop/apps/python/current',
   ]
   let orig = ''
   try { orig = readFileSync(cfgPath, 'utf8') } catch (e) { return { ok: false, reason: '读取 pyvenv.cfg 失败: ' + String(e) } }
