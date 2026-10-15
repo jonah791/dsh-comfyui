@@ -14,8 +14,7 @@
 
 ## 1 · 定位与反定位
 
-**定位**：把主人既有的 `comfyui-skill` CLI（`<bin> --json --dir <workspaceDir> …`）封装成 14 个 DSH 工具，
-让模型在同一会话里完成「查服务器状态 → 启停服务器 → 找工作流 → 提交/执行 → 查任务 → 查队列/模型 → 释放显存」的完整生图操控回路，**零重复实现**（不重写 ComfyUI API 客户端）。
+**定位**：把主人既有的 `comfyui-skill` CLI（`<bin> --json --dir <workspaceDir> …`）封装成 14 个 DSH 工具， 让模型在同一会话里完成「查服务器状态 → 启停服务器 → 找工作流 → 提交/执行 → 查任务 → 查队列/模型 → 释放显存」的完整生图操控回路，**零重复实现**（不重写 ComfyUI API 客户端）。
 
 **反定位（本文不管什么）**：
 - 不管 ComfyUI 本体、节点、模型权重（那属于 `D:\桌面\ComfyUI` 与 `comfyui-manager/workspace`，本插件只调用）
@@ -120,8 +119,7 @@ dsh-comfyui/src/index.ts
 3. 行为可答：`comfy_status` 返回结构化结果（离线也应返回 `ok:false`+`error`，而不是「工具不存在」）。
 4. 落盘产物：执行一次 `comfy_start` 后 `<comfyuiDir>/.dsh-comfyui-startup.log` mtime 前进（这是唯一不依赖内存的物证）。
 
-**回退**：本插件无独立版本锚点，回退即 `git revert` 本仓库最近一次提交 → `pnpm build` → 预检 → 哨兵重启 web；
-配置回退用 `plugin_configure dsh-comfyui` 还原 `comfyuiBin/workspaceDir/comfyuiPython/comfyuiPort` 上一组值（patch 整体替换会留 `.bak-<时间戳>`）。
+**回退**：本插件无独立版本锚点，回退即 `git revert` 本仓库最近一次提交 → `pnpm build` → 预检 → 哨兵重启 web； 配置回退用 `plugin_configure dsh-comfyui` 还原 `comfyuiBin/workspaceDir/comfyuiPython/comfyuiPort` 上一组值（patch 整体替换会留 `.bak-<时间戳>`）。
 
 ## 7 · 可证伪验收清单
 
@@ -135,12 +133,12 @@ dsh-comfyui/src/index.ts
 | A6 | 幂等：已在线时 `comfy_start` 不新起进程 | 调用前后 PID 不变（`comfy_status` 的 `status.server_id`/`netstat` 对比） | 待验收 |
 | A7 | `comfy_workflows` 空列表回退扫描生效 | 造 `data/local/<name>/workflow.json` → `comfy_workflows` 返回 `format:'dir'` 条目 | 待验收 |
 | A8 | venv 自愈不改坏环境 | 人为把 `pyvenv.cfg` 的 `home` 改错 → `comfy_start` 后备份 `pyvenv.cfg.bak` 存在且 `python --version` 可用 | 待验收（需真机 venv） |
-| A9 | CLI 参数拼装恒为 `--json --dir <ws>` 前缀（含空参数数组/空串入参的退化） | `node --test "tests/*.test.mjs"` → `tests/cli.test.mjs` `buildCliArgs` 用例 | **已验收**（2026-09-14 · 60/60 全绿） |
-| A10 | 入参校验拒收非法动作/缺参（queue/task），**不落到 CLI** | 同上 `planQueueCliArgs` / `planTaskCliArgs` 失败路径用例 | **已验收** |
-| A11 | 错误分类优先序 data → stderr → raw → 兜底，截断 500；退化 data（空对象/数组/标量）不误判为错误载荷 | 同上 `cliError` 用例 | **已验收** |
-| A12 | `comfy_workflows` 空列表回退的分类判定：三格式顺序、未声明 server 整棵跳过、目录探针缺失不计入、`.json` 大小写敏感 | `tests/workflows.test.mjs`（`parseWorkspaceConfig` + `discoverWorkflows`） | **已验收** |
-| A13 | pyvenv.cfg 解析的语义分界：无 home 行 ⇒ `null`（未断裂）vs 值为空白 ⇒ `''`（走探活）；CRLF / 尾部分隔符 | `tests/venv.test.mjs` | **已验收** |
-| A14 | 不变量守卫：I1 不触网 / I3 恰好 14 工具 / I4 启动日志落点（检测器先过尸体样本） | `tests/invariants.test.mjs` | **已验收** |
+| A9 | CLI 参数拼装恒为 `--json --dir <ws>` 前缀（含空参数数组/空串入参的退化） | `node --test "tests/*.test.mjs"` → `tests/cli.test.mjs` `buildCliArgs` 用例 | **✔ 已实测**（2026-09-14 · 60/60 全绿） |
+| A10 | 入参校验拒收非法动作/缺参（queue/task），**不落到 CLI** | 同上 `planQueueCliArgs` / `planTaskCliArgs` 失败路径用例 | **✔ 已实测** |
+| A11 | 错误分类优先序 data → stderr → raw → 兜底，截断 500；退化 data（空对象/数组/标量）不误判为错误载荷 | 同上 `cliError` 用例 | **✔ 已实测** |
+| A12 | `comfy_workflows` 空列表回退的分类判定：三格式顺序、未声明 server 整棵跳过、目录探针缺失不计入、`.json` 大小写敏感 | `tests/workflows.test.mjs`（`parseWorkspaceConfig` + `discoverWorkflows`） | **✔ 已实测** |
+| A13 | pyvenv.cfg 解析的语义分界：无 home 行 ⇒ `null`（未断裂）vs 值为空白 ⇒ `''`（走探活）；CRLF / 尾部分隔符 | `tests/venv.test.mjs` | **✔ 已实测** |
+| A14 | 不变量守卫：I1 不触网 / I3 恰好 14 工具 / I4 启动日志落点（检测器先过尸体样本） | `tests/invariants.test.mjs` | **✔ 已实测** |
 
 ## 8 · 与实现的关系
 

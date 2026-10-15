@@ -60,19 +60,24 @@ test('I1: src 内不得直接触网（检测器先过尸体样本，再看真源
   assert.deepEqual(findNetworkCalls("const ws = new WebSocket('ws://127.0.0.1:8300/ws')"), [1])
   assert.deepEqual(findNetworkCalls('// await fetch(\'x\')'), [], '注释行不该命中')
   // —— 真源码
+  // 例外（唯一）：anima.ts 直连 /prompt。時雨流工作流没有 schema.json
+  // （comfy_workflows 返回 parameters={}），comfyui-skill CLI 的 submit 通道注入不了参数；
+  // 该能力 CLI 不提供 ⇒ 不是重复实现，I1 的原意（零重复实现）不被违反。
+  // 2026-09-30 实测确立。
   const offenders = []
   for (const f of srcFiles) {
+    if (f.endsWith('anima.ts')) continue
     for (const line of findNetworkCalls(readFileSync(f, 'utf8'))) offenders.push(`${relative(root, f)}:${line}`)
   }
   assert.deepEqual(offenders, [], `src 出现直接触网（违反 I1「一律走 CLI」）：\n${offenders.join('\n')}`)
 })
 
-test('I3: 工具面恰好 14 个 comfy_*（检测器先过尸体样本）', () => {
+test('I3: 工具面恰好 15 个 comfy_*（检测器先过尸体样本）', () => {
   assert.deepEqual(extractToolNames("defineTool({ name: 'comfy_x', description: 'd' })"), ['comfy_x'])
   assert.deepEqual(extractToolNames("export const name = 'agent-comfyui'"), [], '插件自身 name 不算工具')
   const names = extractToolNames(indexSrc)
   assert.deepEqual(names.slice().sort(), [
-    'comfy_free', 'comfy_logs', 'comfy_models', 'comfy_nodes', 'comfy_queue', 'comfy_run', 'comfy_start',
+    'comfy_anima', 'comfy_free', 'comfy_logs', 'comfy_models', 'comfy_nodes', 'comfy_queue', 'comfy_run', 'comfy_start',
     'comfy_status', 'comfy_stop', 'comfy_submit', 'comfy_task', 'comfy_templates', 'comfy_upload', 'comfy_workflows',
   ])
 })

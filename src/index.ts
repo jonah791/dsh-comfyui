@@ -25,6 +25,11 @@ import {
 } from './cli.js'
 import { discoverWorkflows, parseWorkspaceConfig, type ScanChild, type ScanEntry } from './workflows.js'
 import { pyvenvCfgPath, parsePyvenvHome, basePythonPath } from './venv.js'
+import {
+  applyLoraOverride, buildApiFromWorkflow, submitPrompt, describeSubmitFailure,
+  readPowerLoraEntries, chainLorasInApi,
+  type AnimaSpec,
+} from './anima.js'
 
 export const name = 'agent-comfyui'
 export const inject = ['tools'] as const
@@ -42,6 +47,8 @@ export interface Config {
   comfyuiPython: string
   /** ComfyUI 端口 */
   comfyuiPort: number
+  /** Anima 工作流目录（comfy_anima 用：<此目录>/<workflow>/workflow.json） */
+  animaWorkflowDir: string
 }
 export const Config = z.object({
   comfyuiBin: z.string().default('comfyui-skill'),
@@ -50,6 +57,7 @@ export const Config = z.object({
   comfyuiDir: z.string().default('D:/桌面/ComfyUI'),
   comfyuiPython: z.string().default('D:/桌面/ComfyUI/.venv/Scripts/python.exe'),
   comfyuiPort: z.number().default(8300),
+  animaWorkflowDir: z.string().default('E:/alice/anima/02-技能包/comfyui-good-anima/comfyui-manager/workspace/data/local'),
 })
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -187,6 +195,107 @@ function runCli(config: Config, args: string[], timeoutMs?: number): Promise<Cli
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-comfyui')
+
+  // ---------- comfy_anima：Anima 直提（绕过 CLI schema 层） ----------
+  ctx.tools.register(defineTool({
+    name: 'comfy_anima',
+    description: 'Anima 生图直提：读现役工作流的 workflow.json，把 prompt / 尺寸 / 步数 / 种子 / 基模 / LoRA 链注入后直接 POST /prompt（不走 comfyui-skill CLI —— 時雨流没有 schema.json，CLI 注入不了参数）。参数一律从工作流自身取，只覆盖本工具显式给到的字段，因此主人换基模、删模型都不会让本工具腐化。返回 prompt_id，用 comfy_task 轮询结果。',
+    parameters: {
+      positive: { type: 'string', description: '正向 prompt（Anima 混合格式：质量词组 + @画师 + tags + 2-4 句自然语言）', required: true },
+      negative: { type: 'string', description: '负向 prompt（缺省用工作流自带的长负面词表）' },
+      workflow: { type: 'string', description: '工作流名（缺省 anima-v2-timeai-core ＝ 主人主力時雨流）' },
+      unet: { type: 'string', description: '覆盖基模文件名（缺省用工作流当前值）' },
+      width: { type: 'number', description: '宽（缺省用工作流值）' },
+      height: { type: 'number', description: '高（缺省用工作流值）' },
+      steps: { type: 'number', description: '步数（缺省用工作流值；時雨流 turbo 模式为 12）' },
+      cfg: { type: 'number', description: 'CFG（缺省用工作流值；時雨流 turbo 模式为 1.0）' },
+      sampler: { type: 'string', description: '采样器（缺省用工作流值 euler）' },
+      scheduler: { type: 'string', description: '调度器（缺省用工作流值 beta57）' },
+      seed: { type: 'number', description: '种子（缺省随机）' },
+      prefix: { type: 'string', description: '输出前缀（缺省 alice/anima）' },
+      loras: { type: 'json', description: '覆盖常驻 LoRA 链：[{lora, strength}]；缺省不动工作流原链' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          promptId: { type: 'string' },
+          info: { type: 'json' },
+          workflow: { type: 'string' },
+          error: { type: 'string' },
+        },
+      },
+      render: (_a: unknown, v: any) => [{
+        type: 'text',
+        text: v.ok
+          ? '已提交 ' + String(v.workflow) + '：' + String(v.promptId)
+            + '（' + String(v.info?.nodes ?? '?') + ' 节点 · 基模 ' + String(v.info?.unet ?? '?')
+            + (Array.isArray(v.info?.loras) && v.info.loras.length > 0 ? ' · LoRA ' + v.info.loras.length + ' 条' : '') + '）'
+          : '提交失败：' + String(v.error ?? '').slice(0, 200),
+      }],
+    },
+    async execute(args: {
+      positive: string; negative?: string; workflow?: string; unet?: string
+      width?: number; height?: number; steps?: number; cfg?: number
+      sampler?: string; scheduler?: string; seed?: number; prefix?: string
+      loras?: unknown
+    }) {
+      const wfName = args.workflow ?? 'anima-v2-timeai-core'
+      const wfPath = join(config.animaWorkflowDir, wfName, 'workflow.json')
+      if (!existsSync(wfPath)) {
+        return { ok: false, error: '工作流不存在：' + wfPath }
+      }
+      let wf: { nodes: never[]; links: never[] }
+      try {
+        wf = JSON.parse(readFileSync(wfPath, 'utf8')) as typeof wf
+      } catch (err) {
+        return { ok: false, error: '工作流解析失败：' + String(err) }
+      }
+      const spec: AnimaSpec = {
+        positive: args.positive,
+        negative: args.negative,
+        unet: args.unet,
+        width: args.width,
+        height: args.height,
+        steps: args.steps,
+        cfg: args.cfg,
+        sampler: args.sampler,
+        scheduler: args.scheduler,
+        seed: args.seed,
+        prefix: args.prefix,
+      }
+      // 参数 schema 声明为 json ⇒ 推导类型是 JsonValue，这里运行时收窄
+      const rawLoras = Array.isArray(args.loras)
+        ? (args.loras as Array<{ lora?: unknown; strength?: unknown }>)
+            .filter((it) => typeof it?.lora === 'string')
+            .map((it) => ({ lora: it.lora as string, strength: typeof it.strength === 'number' ? it.strength : undefined }))
+        : []
+      const lorasApplied: string[] = rawLoras.length > 0 ? applyLoraOverride(wf, rawLoras) : []
+      const built = buildApiFromWorkflow(wf, spec)
+      // rgthree PowerLora 经 API 静默不挂（无 lora 入参、widgets_values 被服务器忽略）
+      // ⇒ 取出条目换成标准 LoraLoaderModelOnly 串链。2026-09-30 由 PNG 元数据实测确证。
+      const plEntries = readPowerLoraEntries(wf)
+      const chained = chainLorasInApi(built.api, plEntries)
+      const res = await submitPrompt(config.comfyuiPort, built.api)
+      const promptId = res.prompt_id
+      // info 用字面量构造：BuildInfo 是 interface（无隐式 index signature），
+      // 直接回传不满足 output schema 要求的 JsonValue
+      const info = {
+        nodes: built.info.nodes,
+        unet: built.info.unet,
+        posNode: built.info.posNode,
+        negNode: built.info.negNode,
+        loras: lorasApplied.length > 0 ? lorasApplied : built.info.loras,
+        chainedLoras: plEntries.map((it) => it.lora + '@' + String(it.strength ?? 0.8)),
+        chainWired: chained.wired,
+      }
+      if (typeof promptId !== 'string') {
+        return { ok: false, workflow: wfName, info, error: describeSubmitFailure(res) }
+      }
+      return { ok: true, promptId, workflow: wfName, info }
+    },
+  }))
 
   // ---------- comfy_status：服务器状态 + 资源 ----------
   ctx.tools.register(defineTool({
